@@ -6,7 +6,7 @@ __author__      = "Alexander Shynkarenko"
 __copyright__   = "Copyright 2019, Alex Shynkarenko"
 
 __license__ = "GNU GPLv3"
-__version__ = "1.0"
+__version__ = "1.0.1"
 __maintainer__ = "Alexander Shynkarenko"
 __email__ = "oleksandrszynkarenko@gmail.com"
 __status__ = "Production"
@@ -16,8 +16,59 @@ from Bio import Entrez
 import csv
 import os
 import itertools
+import time
+import threading
+from functools import wraps
 
 
+def rate_limited(max_per_second, mode='wait', delay_first_call=False):
+    """
+    Decorator that make functions not be called faster than
+
+    set mode to 'kill' to just ignore requests that are faster than the
+    rate.
+
+    set delay_first_call to True to delay the first call as well
+    """
+    lock = threading.Lock()
+    min_interval = 1.0 / float(max_per_second)
+    def decorate(func):
+        last_time_called = [0.0]
+        @wraps(func)
+        def rate_limited_function(*args, **kwargs):
+            def run_func():
+                lock.release()
+                ret = func(*args, **kwargs)
+                last_time_called[0] = time.perf_counter()
+                return ret
+            lock.acquire()
+            elapsed = time.perf_counter() - last_time_called[0]
+            left_to_wait = min_interval - elapsed
+            if delay_first_call:
+                if left_to_wait > 0:
+                    if mode == 'wait':
+                        time.sleep(left_to_wait)
+                        return run_func()
+                    elif mode == 'kill':
+                        lock.release()
+                        return
+                else:
+                    return run_func()
+            else:
+                # Allows the first call to not have to wait
+                if not last_time_called[0] or elapsed > min_interval:
+                    return run_func()
+                elif left_to_wait > 0:
+                    if mode == 'wait':
+                        time.sleep(left_to_wait)
+                        return run_func()
+                    elif mode == 'kill':
+                        lock.release()
+                        return
+        return rate_limited_function
+    return decorate
+
+@rate_limited(9, mode='wait')
 def get_ids(term, date, email, api_key = None, database = 'pmc'):
 
     """
@@ -162,7 +213,7 @@ def transform_id(pmcid,email,api_key=None):
 
     return pmid
 
-
+@rate_limited(9, mode='wait')
 def fetch_article_data(pmid, term, date, year, email, api_key=None):
     """
     Fetches article data from pubmed by pmid, then outputs as a dictionary
@@ -297,35 +348,18 @@ def get_abstracts(email, input_file = 'summary.csv', output_file = 'articles.csv
                                           termdate['term'],
                                           termdate['date']))
 
-                        article_data = fetch_article_data(pmid,
-                                                          termdate['term'],
-                                                          termdate['date'],
-                                                          termdate['year'],
-                                                          email,
-                                                          api_key)
+                        # Multithreads the fetching of the data
+                        fetcher = FetchingThread(pmid = pmid,
+                                                 term = termdate['term'],
+                                                 date = termdate['date'],
+                                                 year = termdate['year'],
+                                                 email = email,
+                                                 api_key = api_key,
+                                                 pmcid = pmcid,
+                                                 output_file = output_file)
 
-                        with open(os.path.relpath(output_file),'a+', encoding='utf-8', newline='') as write_file:
-                            csvwrtr = csv.DictWriter(write_file, fieldnames=['term',
-                                                                             'year',
-                                                                             'date',
-                                                                             'pmid',
-                                                                             'pmcid',
-                                                                             'link',
-                                                                             'title',
-                                                                             'journal',
-                                                                             'authors',
-                                                                             'abstract'])
 
-                            csvwrtr.writerow({'term': article_data['term'],
-                                              'year': article_data['year'],
-                                              'date': article_data['date'],
-                                              'pmid': pmid,
-                                              'pmcid': pmcid,
-                                              'link': 'https://www.ncbi.nlm.nih.gov/pubmed/{}'.format(pmid),
-                                              'title': article_data['title'],
-                                              'journal': article_data['journal'],
-                                              'authors': article_data['authors'],
-                                              'abstract': article_data['abstract']})
+                        fetcher.start()
 
                     if pmcid != pmcids[-1]:
                         current = '{}-{}-{}'.format(termdate['term'],
@@ -335,3 +369,50 @@ def get_abstracts(email, input_file = 'summary.csv', output_file = 'articles.csv
                     # after the first article in each run, the programm will fetch each next article
                     skip = False
                     go_on = True
+
+
+class FetchingThread(threading.Thread):
+    """
+    A class that multithreads and fetches data to be written down in the output file designated by 
+    """
+    def __init__(self, pmid, term, date, year, email, api_key, pmcid, output_file):
+        super(FetchingThread, self).__init__()
+        self.pmid = pmid
+        self.term = term
+        self.date = date,
+        self.year = year,
+        self.email = email,
+        self.api_key = api_key
+        self.pmcid = pmcid
+        self.output_file = output_file
+
+    def run(self):
+        article_data = fetch_article_data(self.pmid,
+                                          self.term,
+                                          self.date,
+                                          self.year,
+                                          self.email,
+                                          self.api_key)
+
+        with open(os.path.relpath(self.output_file), 'a+', encoding='utf-8', newline='') as write_file:
+            csvwrtr = csv.DictWriter(write_file, fieldnames=['term',
+                                                             'year',
+                                                             'date',
+                                                             'pmid',
+                                                             'pmcid',
+                                                             'link',
+                                                             'title',
+                                                             'journal',
+                                                             'authors',
+                                                             'abstract'])
+
+            csvwrtr.writerow({'term': article_data['term'],
+                              'year': article_data['year'][0],
+                              'date': article_data['date'][0],
+                              'pmid': self.pmid,
+                              'pmcid': self.pmcid,
+                              'link': 'https://www.ncbi.nlm.nih.gov/pubmed/{}'.format(self.pmid),
+                              'title': article_data['title'],
+                              'journal': article_data['journal'],
+                              'authors': article_data['authors'],
+                              'abstract': article_data['abstract']})
