@@ -314,7 +314,7 @@ def get_abstracts(email, input_file = 'summary.csv', output_file = 'articles.csv
 
     else:
         # if there is, checks for the last analysed article so that there will be no duplicates
-        with open(os.path.relpath(output_file),'r') as read_file2:
+        with open(os.path.relpath(output_file),'r', encoding='utf-8') as read_file2:
             csvrdr2 = csv.DictReader(read_file2)
 
             csvdr_iterable2 = []
